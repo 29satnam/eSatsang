@@ -196,6 +196,9 @@ final class AppViewModel: ObservableObject {
     }
 
     func togglePlayback() async {
+        // Guard here (not just on the button) so rapid VoiceOver double-taps
+        // can't create two concurrent play() calls before isBusy is set.
+        guard !isBusy else { return }
         if isPlaying {
             pausePlayback()
         } else if player != nil {
