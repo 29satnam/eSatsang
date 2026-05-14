@@ -23,7 +23,7 @@ It took a retired phone and gave it one job. It does that job well.
 
 ## Requirements
 
-- iOS 16+ (runs on iPhone 6S)
+- iOS 15+ (runs on iPhone 6S)
 - An active eSatsang account
 
 ## Data Sources
