@@ -38,8 +38,8 @@ struct ContentView: View {
 
 struct LoginView: View {
     @ObservedObject var viewModel: AppViewModel
-    @State private var username = "SSI2019040926984"
-    @State private var password = "1995-03-29"
+    @State private var username = ""
+    @State private var password = ""
     @FocusState private var focusedField: Field?
 
     enum Field {
@@ -50,7 +50,7 @@ struct LoginView: View {
     var body: some View {
         Form {
             Section {
-                TextField("SSI2019040926984", text: $username)
+                TextField("Username", text: $username)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .textContentType(.username)
@@ -59,7 +59,7 @@ struct LoginView: View {
                     .onSubmit { focusedField = .password }
                     .accessibilityLabel("Username")
 
-                SecureField("1995-03-29", text: $password)
+                SecureField("Password", text: $password)
                     .textContentType(.password)
                     .submitLabel(.go)
                     .focused($focusedField, equals: .password)
@@ -83,7 +83,7 @@ struct LoginView: View {
         }
         .navigationTitle("Login")
         .onAppear {
-            username = viewModel.savedUsername ?? "SSI2019040926984"
+            username = viewModel.savedUsername ?? ""
             focusedField = username.isEmpty ? .username : .password
         }
     }
@@ -125,6 +125,13 @@ struct PlayView: View {
                         .frame(minHeight: 260)
                         .accessibilityLabel("Video player")
                         .accessibilityHint("Native video player controls for the live stream.")
+                } else if viewModel.isBuffering {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Buffering…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("Buffering, please wait")
                 } else if viewModel.isPlaying {
                     Text("Audio is playing. You can pause it from the lock screen, Control Center, or headphone controls.")
                         .accessibilityLabel("Audio is playing")
@@ -147,6 +154,7 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var isLoggedIn: Bool
     @Published private(set) var isBusy = false
     @Published private(set) var isPlaying = false
+    @Published private(set) var isBuffering = false
     @Published private(set) var mediaKind: MediaKind?
     @Published private(set) var player: AVPlayer?
     @Published var showAlert = false
@@ -156,6 +164,9 @@ final class AppViewModel: ObservableObject {
     private let api = ESatsangAPI()
     private let credentials = CredentialStore()
     private var heartbeatTask: Task<Void, Never>?
+    private var stallRecoveryTask: Task<Void, Never>?
+    private var timeControlObserver: AnyCancellable?
+    private var interruptionObserver: NSObjectProtocol?
 
     var savedUsername: String? {
         credentials.username
@@ -172,6 +183,7 @@ final class AppViewModel: ObservableObject {
     init() {
         isLoggedIn = CredentialStore().hasSession
         configureRemoteCommands()
+        configureInterruptionHandling()
     }
 
     func login(username: String, password: String) async {
@@ -219,29 +231,35 @@ final class AppViewModel: ObservableObject {
 
         do {
             let entitlement = try await api.mediaEntitlement(session: session)
-            let access = try await api.checkEntitlement(name: entitlement.name, session: session)
-            guard access.enabled else {
-                presentAlert(title: "Cannot Play", message: access.errorText ?? "Access denied.")
+
+            // Entitlement access check and liveness probe are independent — run together.
+            async let access = api.checkEntitlement(name: entitlement.name, session: session)
+            async let mediaProbe = api.probeMedia(url: entitlement.playbackURL, preferredKind: entitlement.preferredKind)
+            let (resolvedAccess, resolvedProbe) = try await (access, mediaProbe)
+
+            guard resolvedAccess.enabled else {
+                presentAlert(title: "Cannot Play", message: resolvedAccess.errorText ?? "Access denied.")
                 return
             }
-
-            let mediaProbe = try await api.probeMedia(url: entitlement.playbackURL, preferredKind: entitlement.preferredKind)
-            guard mediaProbe.isLive else {
+            guard resolvedProbe.isLive else {
                 presentAlert(title: "Stream Not Live", message: "Stream isnt live right now")
                 return
             }
 
             try configureAudioSession()
             let playerItem = AVPlayerItem(url: entitlement.playbackURL)
-            playerItem.preferredForwardBufferDuration = 30
+            // One segment (≈12 s) of buffer — starts audio as soon as the first segment
+            // arrives instead of waiting for the system-default 3 segments (≈36 s).
+            playerItem.preferredForwardBufferDuration = 12
 
             let player = AVPlayer(playerItem: playerItem)
             player.automaticallyWaitsToMinimizeStalling = true
             self.player = player
-            mediaKind = mediaProbe.kind
+            mediaKind = resolvedProbe.kind
             updateNowPlayingInfo(isPlaying: true)
             player.play()
             isPlaying = true
+            observePlayback(player: player)
 
             await api.recordAttendance(entitlementName: entitlement.name, session: session)
             startHeartbeat(entitlementName: entitlement.name, session: session)
@@ -260,10 +278,14 @@ final class AppViewModel: ObservableObject {
     func logout() {
         heartbeatTask?.cancel()
         heartbeatTask = nil
+        stallRecoveryTask?.cancel()
+        stallRecoveryTask = nil
+        timeControlObserver = nil
         player?.pause()
         player = nil
         mediaKind = nil
         isPlaying = false
+        isBuffering = false
         clearNowPlayingInfo()
         credentials.clear()
         isLoggedIn = false
@@ -281,9 +303,42 @@ final class AppViewModel: ObservableObject {
     }
 
     private func pausePlayback() {
+        stallRecoveryTask?.cancel()
+        stallRecoveryTask = nil
         player?.pause()
         isPlaying = false
+        isBuffering = false
         updateNowPlayingInfo(isPlaying: false)
+    }
+
+    private func observePlayback(player: AVPlayer) {
+        timeControlObserver = player.publisher(for: \.timeControlStatus)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                guard let self else { return }
+                switch status {
+                case .playing:
+                    isBuffering = false
+                    stallRecoveryTask?.cancel()
+                    stallRecoveryTask = nil
+                case .waitingToPlayAtSpecifiedRate:
+                    isBuffering = true
+                    // If still stalled after 20 s, jump to the live edge and retry.
+                    stallRecoveryTask?.cancel()
+                    stallRecoveryTask = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 20_000_000_000)
+                        guard !Task.isCancelled else { return }
+                        await MainActor.run { [weak self] in
+                            guard let self, isPlaying else { return }
+                            self.player?.seek(to: .positiveInfinity)
+                        }
+                    }
+                case .paused:
+                    isBuffering = false
+                @unknown default:
+                    break
+                }
+            }
     }
 
     private func startHeartbeat(entitlementName: String, session: Session) {
@@ -308,6 +363,36 @@ final class AppViewModel: ObservableObject {
         try session.setCategory(.playback, mode: .default, options: [])
         try session.setActive(true)
         UIApplication.shared.beginReceivingRemoteControlEvents()
+    }
+
+    private func configureInterruptionHandling() {
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+
+            switch type {
+            case .began:
+                // Call / Siri / alarm started — player already paused by system,
+                // just sync the UI so the button shows "Play".
+                self.isPlaying = false
+                self.updateNowPlayingInfo(isPlaying: false)
+
+            case .ended:
+                // Resume only if the system says it's safe to do so.
+                let options = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                    .flatMap(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
+                guard options.contains(.shouldResume) else { return }
+                self.resumePlayback()
+
+            @unknown default:
+                break
+            }
+        }
     }
 
     private func configureRemoteCommands() {
@@ -424,39 +509,18 @@ struct ESatsangAPI {
     func probeMedia(url: URL, preferredKind: MediaKind?) async throws -> MediaProbe {
         let response = try await fetchMediaProbeResponse(url: url)
         let isLive = response.statusCode.map { (200...299).contains($0) } ?? false
-        let metadataKind = Self.kindFrom(preferredKind: preferredKind, url: url, contentType: response.contentType)
-        let assetKind = metadataKind == nil ? await Self.detectKindWithAsset(url: url) : nil
-        let kind = metadataKind ?? assetKind ?? preferredKind ?? .audio
-
+        let kind = Self.kindFrom(preferredKind: preferredKind, url: url, contentType: response.contentType) ?? .audio
         return MediaProbe(isLive: isLive, kind: kind)
     }
 
     private func fetchMediaProbeResponse(url: URL) async throws -> MediaProbeResponse {
-        do {
-            let headResponse = try await mediaProbeRequest(url: url, method: "HEAD", useRange: false)
-            if let statusCode = headResponse.statusCode, (200...299).contains(statusCode) {
-                return headResponse
-            }
-        } catch {
-            // Some stream servers reject HEAD; a small ranged GET is the fallback.
-        }
-
-        return try await mediaProbeRequest(url: url, method: "GET", useRange: true)
-    }
-
-    private func mediaProbeRequest(url: URL, method: String, useRange: Bool) async throws -> MediaProbeResponse {
         var request = URLRequest(url: url)
-        request.httpMethod = method
-        request.timeoutInterval = 12
-        if useRange {
-            request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
-        }
-
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 8
         let (_, response) = try await urlSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             return MediaProbeResponse(statusCode: nil, contentType: nil)
         }
-
         return MediaProbeResponse(
             statusCode: httpResponse.statusCode,
             contentType: httpResponse.value(forHTTPHeaderField: "Content-Type")
@@ -465,49 +529,20 @@ struct ESatsangAPI {
 
     private static func kindFrom(preferredKind: MediaKind?, url: URL, contentType: String?) -> MediaKind? {
         let contentType = contentType?.lowercased() ?? ""
-        if contentType.contains("video") {
-            return .video
-        }
-        if contentType.contains("audio") {
-            return .audio
-        }
+        if contentType.contains("video") { return .video }
+        if contentType.contains("audio") { return .audio }
 
-        let extensionValue = url.pathExtension.lowercased()
-        if ["mp4", "mov", "m4v", "webm"].contains(extensionValue) {
-            return .video
-        }
-        if ["mp3", "aac", "m4a", "wav", "aiff", "flac", "ogg"].contains(extensionValue) {
-            return .audio
-        }
+        let ext = url.pathExtension.lowercased()
+        if ["mp4", "mov", "m4v", "webm"].contains(ext) { return .video }
+        if ["mp3", "aac", "m4a", "wav", "aiff", "flac", "ogg"].contains(ext) { return .audio }
 
-        if preferredKind == .video {
-            return .video
-        }
+        // Trust the entitlement metadata for both audio and video —
+        // avoids a slow AVURLAsset track-load on every play tap.
+        if let preferredKind { return preferredKind }
 
         return nil
     }
 
-    private static func detectKindWithAsset(url: URL) async -> MediaKind? {
-        let asset = AVURLAsset(url: url)
-
-        return await withCheckedContinuation { continuation in
-            asset.loadValuesAsynchronously(forKeys: ["tracks"]) {
-                var error: NSError?
-                guard asset.statusOfValue(forKey: "tracks", error: &error) == .loaded else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                if !asset.tracks(withMediaType: .video).isEmpty {
-                    continuation.resume(returning: .video)
-                } else if !asset.tracks(withMediaType: .audio).isEmpty {
-                    continuation.resume(returning: .audio)
-                } else {
-                    continuation.resume(returning: nil)
-                }
-            }
-        }
-    }
 
     func recordAttendance(entitlementName: String, session: Session) async {
         var request = authenticatedRequest(path: "recordUserAttendance", session: session)
