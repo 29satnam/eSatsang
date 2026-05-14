@@ -26,6 +26,21 @@ It took a retired phone and gave it one job. It does that job well.
 - iOS 16+ (runs on iPhone 6S)
 - An active eSatsang account
 
+## Data Sources
+
+The API and stream data used by this app are sourced from:
+
+- [shabds/esatsang](https://github.com/shabds/esatsang)
+- [web.esatsang.live](https://web.esatsang.live/)
+
+## Rights & Copyright
+
+All content, audio streams, and associated data are the property of:
+
+**© Ra Dha Sva Aa Mi Satsang Sabha, Dayalbagh, Agra UP 282005 INDIA**
+
+This app is a personal, non-commercial client built solely to access the service on unsupported hardware. It does not host, redistribute, or modify any content.
+
 ## Built With
 
 SwiftUI · AVFoundation · AVKit · MediaPlayer · Security
