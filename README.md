@@ -15,6 +15,7 @@ It took a retired phone and gave it one job. It does that job well.
 ## Features
 
 - **One-tap playback** — login once, tap Play every time after
+- **Audio & video streams** — plays audio or inline video depending on what the stream provides
 - **VoiceOver focused** — every control labelled, lock screen & Control Centre support
 - **Interruption handling** — auto-resumes after phone calls, Siri, and alarms
 - **Buffering feedback** — shows status while the stream loads, auto-recovers from stalls
