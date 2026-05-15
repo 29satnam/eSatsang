@@ -49,42 +49,6 @@ struct ESatsangAPI {
         return try await send(request)
     }
 
-    // MARK: - Stream probe
-
-    func probeMedia(url: URL, preferredKind: MediaKind?) async throws -> MediaProbe {
-        let response = try await fetchMediaProbeResponse(url: url)
-        let isLive = response.statusCode.map { (200...299).contains($0) } ?? false
-        let kind = Self.kindFrom(preferredKind: preferredKind, url: url, contentType: response.contentType) ?? .audio
-        return MediaProbe(isLive: isLive, kind: kind)
-    }
-
-    private func fetchMediaProbeResponse(url: URL) async throws -> MediaProbeResponse {
-        var request = URLRequest(url: url)
-        request.httpMethod = "HEAD"
-        request.timeoutInterval = 8
-        let (_, response) = try await urlSession.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            return MediaProbeResponse(statusCode: nil, contentType: nil)
-        }
-        return MediaProbeResponse(
-            statusCode: httpResponse.statusCode,
-            contentType: httpResponse.value(forHTTPHeaderField: "Content-Type")
-        )
-    }
-
-    private static func kindFrom(preferredKind: MediaKind?, url: URL, contentType: String?) -> MediaKind? {
-        let ct = contentType?.lowercased() ?? ""
-        if ct.contains("video") { return .video }
-        if ct.contains("audio") { return .audio }
-
-        let ext = url.pathExtension.lowercased()
-        if ["mp4", "mov", "m4v", "webm"].contains(ext) { return .video }
-        if ["mp3", "aac", "m4a", "wav", "aiff", "flac", "ogg"].contains(ext) { return .audio }
-
-        if let preferredKind { return preferredKind }
-        return nil
-    }
-
     // MARK: - Session events
 
     func recordAttendance(entitlementName: String, session: Session) async {

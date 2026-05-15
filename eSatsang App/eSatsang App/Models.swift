@@ -17,16 +17,6 @@ struct MediaEntitlement {
     let preferredKind: MediaKind?
 }
 
-struct MediaProbe {
-    let isLive: Bool
-    let kind: MediaKind
-}
-
-struct MediaProbeResponse {
-    let statusCode: Int?
-    let contentType: String?
-}
-
 // MARK: - API request / response shapes
 
 struct LoginRequest: Encodable {
@@ -89,7 +79,6 @@ enum ESatsangError: LocalizedError {
     case invalidResponse
     case requestFailed(Int)
     case noMediaEntitlement
-    case streamNotLive
     case keychainFailed(OSStatus)
 
     var errorDescription: String? {
@@ -99,7 +88,6 @@ enum ESatsangError: LocalizedError {
         case .invalidResponse:    return "The server response could not be read."
         case .requestFailed(let code): return "The server returned status \(code)."
         case .noMediaEntitlement: return "No stream is available for this login."
-        case .streamNotLive:      return "Stream isnt live right now"
         case .keychainFailed:     return "The login could not be saved securely."
         }
     }

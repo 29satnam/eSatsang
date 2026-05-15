@@ -20,7 +20,7 @@ final class AppViewModel: ObservableObject {
     private let credentials = CredentialStore()
     private var heartbeatTask: Task<Void, Never>?
     private var stallRecoveryTask: Task<Void, Never>?
-    private var timeControlObserver: AnyCancellable?
+    private var playbackObservers = Set<AnyCancellable>()
     private var interruptionObserver: NSObjectProtocol?
 
     var savedUsername: String? { credentials.username }
@@ -29,7 +29,7 @@ final class AppViewModel: ObservableObject {
         if isPlaying {
             return mediaKind == .video ? "Pauses the video stream." : "Pauses the audio stream."
         }
-        return "Checks whether the stream is live, then opens the native player."
+        return "Checks whether the stream is live, then starts playback."
     }
 
     init() {
@@ -86,27 +86,19 @@ final class AppViewModel: ObservableObject {
         do {
             let entitlement = try await api.mediaEntitlement(session: session)
 
-            async let access = api.checkEntitlement(name: entitlement.name, session: session)
-            async let mediaProbe = api.probeMedia(url: entitlement.playbackURL, preferredKind: entitlement.preferredKind)
-            let (resolvedAccess, resolvedProbe) = try await (access, mediaProbe)
-
-            guard resolvedAccess.enabled else {
-                presentAlert(title: "Cannot Play", message: resolvedAccess.errorText ?? "Access denied.")
-                return
-            }
-            guard resolvedProbe.isLive else {
-                presentAlert(title: "Stream Not Live", message: "Stream isnt live right now")
+            let access = try await api.checkEntitlement(name: entitlement.name, session: session)
+            guard access.enabled else {
+                presentAlert(title: "Cannot Play", message: access.errorText ?? "Access denied.")
                 return
             }
 
             try configureAudioSession()
-            let playerItem = AVPlayerItem(url: entitlement.playbackURL)
-            playerItem.preferredForwardBufferDuration = 12
 
+            let playerItem = AVPlayerItem(url: entitlement.playbackURL)
             let player = AVPlayer(playerItem: playerItem)
             player.automaticallyWaitsToMinimizeStalling = true
             self.player = player
-            mediaKind = resolvedProbe.kind
+            mediaKind = entitlement.preferredKind ?? .audio
             updateNowPlayingInfo(isPlaying: true)
             player.play()
             isPlaying = true
@@ -119,8 +111,6 @@ final class AppViewModel: ObservableObject {
             presentAlert(title: "Login Required", message: "Please login again.")
         } catch ESatsangError.noMediaEntitlement {
             presentAlert(title: "Cannot Play", message: "No stream is available for this login.")
-        } catch ESatsangError.streamNotLive {
-            presentAlert(title: "Stream Not Live", message: "Stream isnt live right now")
         } catch {
             presentAlert(title: "Cannot Play", message: error.localizedDescription)
         }
@@ -131,7 +121,7 @@ final class AppViewModel: ObservableObject {
         heartbeatTask = nil
         stallRecoveryTask?.cancel()
         stallRecoveryTask = nil
-        timeControlObserver = nil
+        playbackObservers.removeAll()
         player?.pause()
         player = nil
         mediaKind = nil
@@ -145,7 +135,7 @@ final class AppViewModel: ObservableObject {
     private func resumePlayback() {
         // If player item failed (e.g. expired CDN token), fetch fresh entitlements.
         if player == nil || player?.currentItem?.status == .failed {
-            timeControlObserver = nil
+            playbackObservers.removeAll()
             player?.pause()
             player = nil
             Task { await play() }
@@ -173,7 +163,10 @@ final class AppViewModel: ObservableObject {
     // MARK: - Playback observation
 
     private func observePlayback(player: AVPlayer) {
-        timeControlObserver = player.publisher(for: \.timeControlStatus)
+        playbackObservers.removeAll()
+
+        // Track buffering state for UI feedback.
+        player.publisher(for: \.timeControlStatus)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] status in
                 guard let self else { return }
@@ -190,7 +183,7 @@ final class AppViewModel: ObservableObject {
                         guard !Task.isCancelled else { return }
                         await MainActor.run { [weak self] in
                             guard let self, isPlaying else { return }
-                            self.timeControlObserver = nil
+                            playbackObservers.removeAll()
                             self.player?.pause()
                             self.player = nil
                         }
@@ -202,6 +195,24 @@ final class AppViewModel: ObservableObject {
                     break
                 }
             }
+            .store(in: &playbackObservers)
+
+        // If the item fails to load, the stream isn't reachable right now.
+        player.currentItem?.publisher(for: \.status)
+            .receive(on: DispatchQueue.main)
+            .filter { $0 == .failed }
+            .first()
+            .sink { [weak self] _ in
+                guard let self, isPlaying else { return }
+                playbackObservers.removeAll()
+                self.player?.pause()
+                self.player = nil
+                isPlaying = false
+                isBuffering = false
+                updateNowPlayingInfo(isPlaying: false)
+                presentAlert(title: "Stream Not Live", message: "The stream isn't available right now. Try again later.")
+            }
+            .store(in: &playbackObservers)
     }
 
     // MARK: - Heartbeat
