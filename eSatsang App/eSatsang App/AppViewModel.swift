@@ -75,8 +75,14 @@ final class AppViewModel: ObservableObject {
     }
 
     private func play() async {
-        guard let session = credentials.session else {
-            logout()
+        // Use stored session, or try a silent re-login if the token has expired.
+        let session: Session
+        if let stored = credentials.session {
+            session = stored
+        } else if await silentRelogin(), let refreshed = credentials.session {
+            session = refreshed
+        } else {
+            expireSession()
             return
         }
 
@@ -107,8 +113,8 @@ final class AppViewModel: ObservableObject {
             await api.recordAttendance(entitlementName: entitlement.name, session: session)
             startHeartbeat(entitlementName: entitlement.name, session: session)
         } catch ESatsangError.notAuthenticated {
-            logout()
-            presentAlert(title: "Login Required", message: "Please login again.")
+            expireSession()
+            presentAlert(title: "Session Expired", message: "Please login again.")
         } catch ESatsangError.noMediaEntitlement {
             presentAlert(title: "Cannot Play", message: "No stream is available for this login.")
         } catch {
@@ -130,6 +136,39 @@ final class AppViewModel: ObservableObject {
         clearNowPlayingInfo()
         credentials.clear()
         isLoggedIn = false
+    }
+
+    /// Session expired — stop playback and go to login screen, but keep the
+    /// username and Keychain password so re-login is pre-filled / one tap.
+    private func expireSession() {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        stallRecoveryTask?.cancel()
+        stallRecoveryTask = nil
+        playbackObservers.removeAll()
+        player?.pause()
+        player = nil
+        mediaKind = nil
+        isPlaying = false
+        isBuffering = false
+        clearNowPlayingInfo()
+        credentials.clearSession()
+        isLoggedIn = false
+    }
+
+    /// Attempts a silent re-login using stored Keychain credentials.
+    /// Returns true if the session was successfully refreshed.
+    @discardableResult
+    private func silentRelogin() async -> Bool {
+        guard let username = credentials.username,
+              let password = credentials.readPassword() else { return false }
+        do {
+            let session = try await api.login(username: username, password: password)
+            try credentials.save(username: username, password: password, session: session)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func resumePlayback() {
@@ -225,7 +264,7 @@ final class AppViewModel: ObservableObject {
                 let stillAllowed = await api.heartbeat(entitlementName: entitlementName, session: session)
                 if !stillAllowed {
                     await MainActor.run {
-                        self.logout()
+                        self.expireSession()
                         self.presentAlert(title: "Session Ended", message: "Please login again.")
                     }
                     return

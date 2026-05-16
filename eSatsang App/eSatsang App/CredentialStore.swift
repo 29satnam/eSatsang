@@ -30,11 +30,34 @@ struct CredentialStore {
         try savePassword(password)
     }
 
+    /// Full wipe — use only on explicit user-initiated logout.
     func clear() {
         defaults.removeObject(forKey: "username")
         defaults.removeObject(forKey: "uuid")
         defaults.removeObject(forKey: "sessionToken")
         deletePassword()
+    }
+
+    /// Clears only the session token. Username and Keychain password are kept
+    /// so the login screen can re-authenticate without the user retyping anything.
+    func clearSession() {
+        defaults.removeObject(forKey: "uuid")
+        defaults.removeObject(forKey: "sessionToken")
+    }
+
+    /// Returns the stored Keychain password, if any.
+    func readPassword() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String:       kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: passwordAccount,
+            kSecReturnData as String:  true,
+            kSecMatchLimit as String:  kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     private func savePassword(_ password: String) throws {
